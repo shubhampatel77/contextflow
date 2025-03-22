@@ -1,14 +1,15 @@
 import torch
-# Make CUDA operations deterministic
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 from transformers import (
     AutoTokenizer, AutoModelForCausalLM, DPRQuestionEncoder,
     DataCollatorForLanguageModeling, AutoConfig, PreTrainedModel,
-    get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+    get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup,
+    BitsAndBytesConfig
 )
 from box import Box
+import yaml
 import os
 import json
 import pickle
@@ -227,7 +228,7 @@ def train(
         total_loss = 0
         val_count = 0
         for i, batch in enumerate(tqdm(train_dataloader, desc=f"Epoch {epoch+1}")):
-            inputs = {k: (v if is_supervised and k == 'labels' else v.to(accelerator.device)) for k, v in batch.items()}
+            inputs = {k: (v if is_supervised and k == 'answer_texts' else v.to(accelerator.device)) for k, v in batch.items()}
             with accelerator.autocast():
                 outputs = model(**inputs)
                 loss = (outputs if is_supervised else outputs.loss) / gradient_accumulation_steps
@@ -360,18 +361,82 @@ def train(
     
     wandb.finish()
 
-def load_or_finetune(retriever_docs, uft_docs, config):
+def load_specific_checkpoint(repo_id, specific_checkpoint, retriever_docs, accelerator):
+    """
+    Load a model from a specific checkpoint path.
+    
+    Args:
+        repo_id: Repository ID
+        specific_checkpoint: Path to the specific checkpoint to load
+        retriever_docs: Documents for retriever initialization
+        accelerator: Accelerator for device management
+        
+    Returns:
+        Loaded model from the specified checkpoint
+    """
+    logger.info(f"Loading specific checkpoint: {specific_checkpoint}")
+    
+    # Determine experiment path by extracting from checkpoint path
+    # Remove checkpoint-specific part to get the experiment directory
+    experiment_path = specific_checkpoint
+    if '/uft/' in specific_checkpoint:
+        experiment_path = specific_checkpoint.split('/uft/')[0]
+    elif '/sft/' in specific_checkpoint:
+        experiment_path = specific_checkpoint.split('/sft/')[0] 
+    elif '/checkpoint-epoch-' in specific_checkpoint:
+        experiment_path = os.path.dirname(specific_checkpoint)
+    
+    # Load config from repository based on experiment path
+    config_path = os.path.join(experiment_path, "config.yml")
+    logger.info(f"config path on Hub: {config_path}")
+    try:
+        config_file = hf_hub_download(repo_id, config_path)
+        with open(config_file, "r") as file:
+            config = Box(yaml.safe_load(file))
+            logger.info(f"Loaded config from: {config_path}")
+    except Exception as e:
+        logger.error(f"Error loading config from: {config_path}: {e}")
+        raise
+    
+
+    # Log checkpoint details
+    if '/val/' in specific_checkpoint:
+        # Extract epoch and step info from validation checkpoint
+        match = re.search(r'best_model_epoch_(\d+)_step_(\d+)', specific_checkpoint)
+        if match:
+            epoch_num, step_num = match.groups()
+            logger.info(f"Loading validation checkpoint from epoch: {epoch_num}, optimizer step: {step_num}")
+    else:
+        # Extract epoch from regular checkpoint
+        match = re.search(r'checkpoint-epoch-(\d+)', specific_checkpoint)
+        if match:
+            epoch_num = match.group(1)
+            logger.info(f"Loading checkpoint from epoch: {epoch_num}")
+    
+    # Load the model
+    model = load_trained_model(
+        repo_id=repo_id,
+        latest_checkpoint=specific_checkpoint,
+        config=config,
+        retriever_docs=retriever_docs,
+        accelerator=accelerator,
+    )
+    
+    return model
+ 
+def load_or_finetune(retriever_docs, uft_docs, config, specific_checkpoint=None):
     # Initialize the accelerator with fp16, init first to use device in retriever/anywhere else
     # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
     accelerator = Accelerator(mixed_precision="fp16")
     
-    # from box import Box
-    # import yaml
-    # config_path = hf_hub_download(config.repo_id, "experiments/combined/custom-selection/base/run1/config.yml")
 
-    # with open(config_path, "r") as file:
-    #     config = Box(yaml.safe_load(file))
-    #     logger.info("LOADED CONFIG FROM HUB")
+    if specific_checkpoint:
+        return load_specific_checkpoint(
+            repo_id=config.repo_id,
+            specific_checkpoint=specific_checkpoint,
+            retriever_docs=retriever_docs,
+            accelerator=accelerator
+        )
     
     annotated_train = load_json(config.dataset.train)
     human_annotated_train = load_json(config.dataset.human_train)
@@ -399,7 +464,7 @@ def load_or_finetune(retriever_docs, uft_docs, config):
         
     model_exists = latest_epoch is not None and latest_checkpoint is not None
     if model_exists:
-        logger.info(f"\n latest_checkpoint: {latest_checkpoint},\n latest_epoch: {latest_epoch}")
+        logger.info(f"\n latest_checkpoint: {latest_checkpoint}\n latest_epoch: {latest_epoch}")
 
     # TODO: YAML filename harcoded here, make it more flexible in future
     config_path = os.path.join(experiment_path, "config.yml")
@@ -420,10 +485,8 @@ def load_or_finetune(retriever_docs, uft_docs, config):
     if model_exists:
         if exp_type == 'uft-only':
             config_epochs = config.model.training.unsupervised.optimization.num_epochs
-        elif exp_type == 'sft-only':
+        else: # has to be either sft-only or combined
             config_epochs = config.model.training.supervised.optimization.num_epochs
-        else:
-            config_epochs = None
            
         # If training complete, load and return
         if config_epochs and latest_epoch == config_epochs:
@@ -849,11 +912,17 @@ def load_trained_model(
         subfolder=os.path.join(latest_checkpoint, "generator", "tokenizer")
     )
     
+    quantization_config = None
+    if not is_trainable:
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True
+            # Add other parameters as needed
+        )
     # Load base generator model
     generator = AutoModelForCausalLM.from_pretrained(
         config.model.generator.base_model,
         attn_implementation=config.model.generator.attn_implementation,
-        load_in_8bit=not is_trainable,
+        quantization_config=quantization_config,
         torch_dtype=torch.float16,
         device_map="auto"
     )
@@ -914,7 +983,9 @@ def load_trained_model(
         if is_trainable:
             log_final_message("resuming UFT for uft-only/combined", latest_checkpoint)
         else:
-            log_final_message("inference for any uft-only/sft-only/combined", latest_checkpoint)
+            # Add to config to prevent generate() warning, see 03/21 notes point 1.
+            model.generator.config.pad_token_id = model.generator_tokenizer.pad_token_id
+            log_final_message("inference for either uft-only/sft-only/combined", latest_checkpoint)
             
     log_memory_usage("after exiting load_trained_model()")
     return model

@@ -1,6 +1,6 @@
 from transformers import (
-    DPRContextEncoder, DPRContextEncoderTokenizerFast,
-    DPRQuestionEncoderTokenizerFast, AutoTokenizer, RagRetriever, RagConfig
+    DPRContextEncoder, DPRContextEncoderTokenizer,
+    DPRQuestionEncoderTokenizer, AutoTokenizer, RagRetriever, RagConfig
 )
 from datasets import Features, Sequence, Value, Dataset, concatenate_datasets
 import torch
@@ -24,15 +24,22 @@ class CustomRetriever:
     def __init__(self, config, retriever_docs, accelerator):
         self.uploader = HubUploader()
         self.repo_id = config.repo_id
-        self.tokenizer = DPRContextEncoderTokenizerFast.from_pretrained(config.model.retriever.ctx_encoder)
-        self.model = DPRContextEncoder.from_pretrained(config.model.retriever.ctx_encoder).to(accelerator.device)
+        self.tokenizer = DPRContextEncoderTokenizer.from_pretrained(config.model.retriever.ctx_encoder)
+        self.context_encoder = DPRContextEncoder.from_pretrained(config.model.retriever.ctx_encoder).to(accelerator.device)
         self.retriever = self.initialize_retriever(config, retriever_docs, accelerator)
         self.dataset = None
         self.index = None
+        
+        self.max_doc_len = 2048 # TODO: come back and re-analyze
 
     # TODO: add feature to copy over dataset + index from other runs when no changes to it, to save compute time and mem
     def initialize_retriever(self, config, retriever_docs, accelerator):
-        experiment_path = os.path.join("experiments", *config.model.experiment.values())
+        # The Hub stores all keys of the config in lexicographic order, messing up paths
+        exp = config.model.experiment
+        # Explicit ordering required
+        experiment_path = os.path.join(
+            "experiments", exp.type, exp.scoring, exp.variant, exp.run_id
+        )
         # TODO: dataset/FAISS filename hardcoded here, make it more flexible in future
         # full name needed since, that will be the name of the file uploaded to Hub
         # TODO: may want to change memory to datastore
@@ -128,10 +135,15 @@ class CustomRetriever:
     
     def embed(self, documents, accelerator):
         input_ids = self.tokenizer(
-            documents["title"], documents["text"], truncation=True, padding="longest", return_tensors="pt"
+            documents["title"], 
+            documents["text"], 
+            truncation=True, 
+            padding="max_length", 
+            max_length=self.max_doc_len, 
+            return_tensors="pt"
         )["input_ids"]
         with torch.no_grad(), accelerator.autocast():
-            embeddings = self.model(input_ids.to(self.model.device), return_dict=True).pooler_output
+            embeddings = self.context_encoder(input_ids.to(self.context_encoder.device), return_dict=True).pooler_output
         return {"embeddings": embeddings.detach().cpu().numpy()}
 
     def process_retriever_docs(self, retriever_docs, accelerator):
