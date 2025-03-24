@@ -2,10 +2,13 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import MistralForCausalLM, AutoTokenizer, DPRQuestionEncoder, DPRQuestionEncoderTokenizerFast
+from transformers import (
+    AutoTokenizer, DPRQuestionEncoder, DPRQuestionEncoderTokenizer,
+    RagRetriever, get_linear_schedule_with_warmup
+)
 from torch.utils.data import DataLoader, Dataset
-from transformers import get_linear_schedule_with_warmup
 import bitsandbytes as bnb
+from accelerate import Accelerator
 from tqdm.auto import tqdm
 from typing import List, Tuple, Dict, Union, Optional
 from trl import setup_chat_format
@@ -15,29 +18,31 @@ logger = setup_logger(enable_logging=True)
 
 class RAGSequence(nn.Module):
     """
-    RAG implementation supporting decoder-only LLMs with joint optimization.
+    RAG implementation supporting decoder-only LLMs with joint optimization. Implements novel probability 
+    marginalization approach: 
     
-    Implements novel probability marginalization approach:
-    p_theta(y^(m) | z_k^(m), x^(m)) approximately equals p_theta(y^(m) | f(z_k^(m), x^(m)))
-    where f() is due to prompt augmentation for generator
+        p_theta(y | z_k, x) approximately equals p_theta(y | f(z_k, x)), 
+        
+    where y is the output sequence, z_k is the kth retrieved document latent, x is the input sequence and
+    function f() is due to prompt augmentation (system prompt, context, instructions etc.) for generator LLM.
     
     Args:
         question_encoder: DPR question encoder
-        retriever: Document retriever
+        retriever: RAG retriever (for documents)
         generator_tokenizer: Tokenizer for decoder-only LLM
-        generator: Decoder-only language model
+        generator: Decoder-only LLM
     """
     
     def __init__(
         self, 
         question_encoder: DPRQuestionEncoder, 
-        retriever, 
-        generator_tokenizer, 
-        generator, 
-        accelerator, 
-        max_seq_len_train=512,
-        question_max_seq_len_inference=64,
-        generator_max_seq_len_inference=1024
+        retriever: RagRetriever, 
+        generator_tokenizer: AutoTokenizer, 
+        generator: AutoModelForCausalLM, 
+        accelerator: Accelerator, 
+        max_seq_len_train: int = 512,
+        question_max_seq_len_inference: int = 64,
+        generator_max_seq_len_inference: int = 1024
     ):
     
         super().__init__()
@@ -53,9 +58,31 @@ class RAGSequence(nn.Module):
         self.accelerator = accelerator
         self.device = accelerator.device
     
+    def generate_with_text(
+        self, 
+        inputs: Union[str, List[str]], 
+        do_retrieval: bool = False, 
+        num_docs: int = 5,
+        skip_special_tokens: bool = True,
+        instruction: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        generator_max_length: int = 128,
+        **kwargs
+    ) -> List[Dict[str, str]]:
         
-    # Function to play around with trained models
-    def generate_with_text(self, inputs: Union[str, List[str]], generator_max_length=32, do_retrieval=False, **kwargs):
+        """
+        Generate text from text input.
+        
+        Args:
+            inputs: A string or a list of strings
+            do_retrieval: To do RAG or directly use the generator (decoder-only LLM)
+            num_docs: If do_retrieval, specify no. of documents to retrieve
+            skip_special_tokens: To skip special tokens in final responses or not
+            instruction: Optional[str] = None,
+            system_prompt: Optional[str] = None,
+            generator_max_length: Max sequence length when directly using generator
+            **kwargs: Additional generation kwargs for AutoModelForCausalLM
+        """
         
         if isinstance(inputs, str):
             inputs = [inputs]
@@ -74,7 +101,6 @@ class RAGSequence(nn.Module):
                 if k in ['input_ids', 'attention_mask']
             }
         else:
-            # Tokenize inputs
             encoded_inputs = self.generator_tokenizer(
                 inputs,
                 return_tensors="pt",
@@ -83,18 +109,18 @@ class RAGSequence(nn.Module):
                 max_length=generator_max_length,
             ).to(self.device)
         
-        # call generate() after tokenization
         return self.generate(**encoded_inputs, do_retrieval=do_retrieval, **kwargs)
     
     
-    # batched inference for evaluation, hence compatible with InferenceDataset
-    # add kwargs from claude chat
     def generate(
         self, 
-        input_ids,
-        attention_mask,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
         do_retrieval: bool,
         num_docs: int = 5, 
+        skip_special_tokens: bool = True,
+        instruction: Optional[str] = None,
+        system_prompt: Optional[str] = None,
         num_return_sequences: int = 1, 
         max_new_tokens: int = 128, 
         no_repeat_ngram_size: int = 3, 
@@ -102,21 +128,21 @@ class RAGSequence(nn.Module):
         temperature: float = 1.0,
         top_p: float = 1.0,
         top_k: int = 50,
-        skip_special_tokens: bool = True,
-        instruction: Optional[str] = None,
-        system_prompt: Optional[str] = None,
         **kwargs
     ) -> List[Dict[str, str]]:
+        
         """
-        Generate answer and return retrieved context.
+        Batched generation of text from tokenized input (input_ids and attention_mask).
+        Better suited for inference leveraging batched generation.
         
         Args:
-            input_ids: [batch_size, max_seq_len] tokenized input ids using 
-                self.retriever.question_encoder.tokenizer [DRPQuestionEncoderTokenizerFast]
+            input_ids: [batch_size, max_seq_len] tokenized input ids using either
+                DRPQuestionEncoderTokenizerFast or AutoTokenizer (LlamaTokenizerFast)
+                
             attention_mask: [batch_size, max_seq_len] for question encoder
             num_return_sequences: Number of sequences to generate
             max_new_tokens: Max new tokens to generate
-            num_docs: Number of top contexts to retrieve
+            num_docs: Number of top documents to retrieve
             **kwargs: Additional generation kwargs
             
         Returns:
@@ -138,14 +164,19 @@ class RAGSequence(nn.Module):
                     doc = self.retriever.index.dataset[int(retrieved_doc_ids[b,d].item())]
                     batch_contexts.append(f"Title: {doc['title']}\nText: {doc['text']}")
                 contexts.append("\n\n".join(batch_contexts))
-        
-        # Generate prompts
-        if do_retrieval:
+                
             if instruction is None:
                 instruction = (
                     "Use the given context only if relevant to answer the question.\n"
                     "Otherwise, if you don't know, just say \"I don't know.\"\n"
                 )
+        else:
+            if instruction is None:
+                instruction = (
+                   "Answer the question to the best of your ability.\n"
+                    "If you don't know, just say \"I don't know.\"\n"
+                )
+                
         if system_prompt is None:
             system_prompt = "You are a friendly chatbot who always responds precisely."
             
@@ -160,7 +191,7 @@ class RAGSequence(nn.Module):
                 )
                 user_prompt = (
                     f"{instruction}\n"
-                    f"Context:\n{contexts[i]}\n"
+                    f"Context:\n{contexts[i]}\n"  # TODO: ability to provide custom context
                     f"Question: {question}\n"
                     "Answer:"
                 )
@@ -232,14 +263,16 @@ class RAGSequence(nn.Module):
             batch_outputs.append(output)
         
         return batch_outputs
-
-    # TODO: ability to provide custom context
-    def inference_prompt(self, input_ids, contexts, do_retrieval, instruction=None, system_prompt=None):
         
-        pass
-
+    def prepare_for_sft(self) -> None:
+           
+        """
+        Prepare the model for supervised finetuning (SFT) by setting up the chat format,
+        and ensuring custom padding token is added to the generator tokenizer. Model embedding
+        matrix's vocab_size is resized accordingly.
         
-    def prepare_for_sft(self):
+        """
+        
         if self.generator_tokenizer.chat_template:
             self.generator_tokenizer.chat_template = None
             
@@ -259,7 +292,8 @@ class RAGSequence(nn.Module):
         # SEE Llama tokenizers and their training strategy
         # self.generator_tokenizer.padding_side = "right"
         
-    def add_pad_token(self, pad_token):
+    def add_pad_token(self, pad_token: str) -> None:
+        """Add custom pad token to the generator tokenizer and resize the model's embedding matrix."""
         vocab_size = self.generator.config.vocab_size
         
         self.generator_tokenizer.add_tokens([pad_token])
@@ -269,7 +303,28 @@ class RAGSequence(nn.Module):
         self.generator.resize_token_embeddings(len(self.generator_tokenizer))
         logger.info(f"Resized from {vocab_size} to {len(self.generator_tokenizer)}")
 
-    def forward(self, input_ids, attention_mask, answer_texts, debug_print=True):
+    def forward(
+        self, 
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor, 
+        answer_texts: List[str], 
+        debug_print: bool = False
+    ) -> Optional[torch.Tensor]:
+        
+        """
+        Forward pass through RAGSequence model. Retrieves documents, generates sequences and computes loss.
+        
+        Args:
+            input_ids: [batch_size, max_seq_len] tokenized input ids using DRPQuestionEncoderTokenizer
+                where max_seq_len is the max sequence length for DPRQuestionEncoder (see SFTDataset in dataloader.py)
+            attention_mask: [batch_size, max_seq_len] for question encoder
+            answer_texts: List of answer strings of length [batch_size]
+            debug_print: To print debug information
+            
+        Returns:
+            loss: Loss tensor if labels are provided, else None  
+        """
+        
         # Retrieve documents
         retrieved_doc_ids, retriever_scores = self.retrieve(input_ids, attention_mask)
         
@@ -281,10 +336,23 @@ class RAGSequence(nn.Module):
         # Compute loss if labels are provided
         loss = None
         if labels is not None:
-            loss = self.compute_loss(retriever_scores, logits, labels)
+            loss = self.compute_loss(retriever_scores, logits, labels, debug_print=debug_print)
         return loss
     
-    def retrieve(self, input_ids, attention_mask, num_docs=5):
+    def retrieve(self, input_ids, attention_mask, num_docs: int = 5) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        """
+        Retrieves top num_docs documents using Dense Passage Retrieval (DPR) by computing retriever scores.
+        Args:
+            input_ids: [batch_size, max_seq_len] tokenized input ids using DRPQuestionEncoderTokenizer
+            attention_mask: [batch_size, max_seq_len] for question encoder
+            num_docs: Number of documents to retrieve
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - retrieved_doc_ids: Shape [batch_size, num_docs] containing retrieved document indices
+                - retriever_scores: Shape [batch_size, num_docs] containing retriever scores
+        """
+        
         question_hidden_states = self.question_encoder(input_ids=input_ids, attention_mask=attention_mask)[0]
         docs_dict = self.retriever(
             input_ids.cpu().numpy(),
@@ -307,12 +375,12 @@ class RAGSequence(nn.Module):
         input_ids: torch.Tensor, 
         retrieved_doc_ids: torch.Tensor, 
         answer_texts: List[str],
-        debug_print=True
+        debug_print: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
         """
         Construct proper input (prompts) and target (labels) tensors for the generator. NOTE: Not to confuse 
-        max_seq_len (of DPRQuestionEncoderTokenizerFast) with self.max_seq_len, which is for self.generator_tokenizer
+        max_seq_len (of DPRQuestionEncoderTokenizer) with self.max_seq_len, which is for self.generator_tokenizer
         
         Args:
             input_ids (torch.Tensor): 
@@ -412,8 +480,27 @@ class RAGSequence(nn.Module):
         
         return outputs.logits, labels
 
-    def compute_loss(self, retriever_scores, logits, labels):
-
+    def compute_loss(
+        self, 
+        retriever_scores: torch.Tensor, 
+        logits: torch.Tensor, 
+        labels: torch.Tensor,
+        debug_print: bool = False
+    ) -> torch.Tensor:
+        
+        """
+        Compute loss for the retriever and the generator (decoder-only LLM). The loss is computed by marginalizing over
+        the retrieved documents and the generated sequences.
+        
+        Args:
+            retriever_scores: [batch_size, num_docs] tensor containing retriever scores
+            logits: [batch_size * num_docs, max_seq_len, vocab_size] tensor containing generator logits
+            labels: [batch_size * num_docs, max_seq_len] tensor containing target labels
+            
+        Returns:
+            loss: Computed loss tensor
+        """
+        
         vocab_size = logits.shape[-1]
         batch_size, num_docs = retriever_scores.shape
 
@@ -442,13 +529,16 @@ class RAGSequence(nn.Module):
         # Apply mask and compute sequence log probabilities
         masked_log_probs = target_log_probs * mask.float()
         seq_log_probs = masked_log_probs.sum(-1)
-        print(seq_log_probs)
+        
+        if debug_print:
+            logger.info(f"seq_log_probs:\n{seq_log_probs}")
 
         # Compute generator loss, see notes and torch.CrossEntropy() docs
         # N spans batch_size, num_docs and max_seq_len,
         # so avg not by N but by N - |labels == -100| = mask.sum()
         gen_loss = -masked_log_probs.sum()/mask.sum()
-        print(f"calculated loss = {gen_loss}")
+        if debug_print:
+            logger.info(f"calculated loss: {gen_loss}")
 
         # Compute retriever log probabilities
         retriever_log_probs = F.log_softmax(retriever_scores, dim=-1)
@@ -461,18 +551,16 @@ class RAGSequence(nn.Module):
 
         # Compute final loss (negative log likelihood)
         loss = -marginalized_log_probs.mean()
-        print(f"final computed loss = {loss}")
+        if debug_print:
+            print(f"Final computed loss: {loss}")
 
         return loss
     
     # Other cleanup options like accelerate.clear(), gc.collect(), torch.cuda.ipc_collect()
     # empty CUDA cache, del model don't seem to work, see 03/15 TODO point 3.
-    def to_cpu(self):
-        """Efficiently move all components to CPU."""
+    def to_cpu(self) -> None:
+        """Post-training cleanup by moving all components to CPU."""
         self.question_encoder.to('cpu')
         self.generator.to('cpu')
         if hasattr(self, 'retriever') and hasattr(self.retriever, 'to'):
             self.retriever.to('cpu')
-            
-
-
