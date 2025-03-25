@@ -18,23 +18,30 @@ logger = setup_logger(enable_logging=True)
 
 class RAGSequence(nn.Module):
     """
-    RAG implementation supporting decoder-only LLMs with joint optimization. Implements novel probability 
-    marginalization approach for combining retriever and generator log probabilities. The model is designed: 
+    RAG implementation supporting decoder-only LLMs with joint optimization.
     
-        p_theta(y | z_k, x) approximately equals p_theta(y | f(z_k, x)), 
-        
-    where y is the output sequence, z_k is the kth retrieved document latent, x is the input sequence and
-    function f() is due to prompt augmentation (system prompt, context, instructions etc.) for generator LLM.
+    This model implements a novel probability marginalization approach for combining retriever and generator log probabilities.
+    It follows the formulation: p_θ(y | z_k, x) ≈ p_θ(y | f(z_k, x)), where y is the output sequence, z_k is the kth 
+    retrieved document latent, x is the input sequence, and f() represents the prompt augmentation function (system prompt, 
+    context, instructions, etc.) for the generator LLM.
     
     Args:
-        question_encoder (DPRQuestionEncoder): 
-            Dense Passage Retrieval (DPR) question encoder
-        retriever (RagRetriever):
-            RAG retriever (for document chunks)
-        generator_tokenizer (AutoTokenizer): 
-            Tokenizer for decoder-only LLM
-        generator (AutoModelForCausalLM): 
-            Decoder-only LLM
+        question_encoder (`DPRQuestionEncoder`):
+            Dense Passage Retrieval (DPR) question encoder for converting queries into vector representations.
+        retriever (`RagRetriever`):
+            Document retriever component for fetching relevant document chunks from the knowledge base.
+        generator_tokenizer (`AutoTokenizer`):
+            Tokenizer for the decoder-only language model.
+        generator (`AutoModelForCausalLM`):
+            Decoder-only language model used for generating responses.
+        accelerator (`Accelerator`):
+            Accelerator instance for device management and mixed precision training.
+        generator_max_seq_len_train (`int`, *optional*, defaults to 512):
+            Maximum sequence length for generator used during training.
+        question_max_seq_len_inference (`int`, *optional*, defaults to 64):
+            Maximum sequence length for question encoding during inference.
+        generator_max_seq_len_inference (`int`, *optional*, defaults to 1024):
+            Maximum sequence length for generator inputs during inference.
     """
     
     def __init__(
@@ -44,7 +51,7 @@ class RAGSequence(nn.Module):
         generator_tokenizer: AutoTokenizer, 
         generator: AutoModelForCausalLM, 
         accelerator: Accelerator, 
-        max_seq_len_train: int = 512,
+        generator_max_seq_len_train: int = 512,
         question_max_seq_len_inference: int = 64,
         generator_max_seq_len_inference: int = 1024
     ):
@@ -55,7 +62,7 @@ class RAGSequence(nn.Module):
         self.generator_tokenizer = generator_tokenizer
         self.generator = generator
         
-        self.max_seq_len_train = max_seq_len_train
+        self.generator_max_seq_len_train = generator_max_seq_len_train
         self.question_max_seq_len_inference = question_max_seq_len_inference
         self.generator_max_seq_len_inference = generator_max_seq_len_inference
         
@@ -73,39 +80,35 @@ class RAGSequence(nn.Module):
         generator_max_length: int = 128,
         **kwargs
     ) -> List[Dict[str, str]]:
-        
         """
-        Generate text responses from raw string inputs using the decoder-only generator model, 
-        with optional document retrieval via RAG.
-
+        Generate text responses from raw string inputs with optional document retrieval.
+        
         This method wraps tokenization and generation into a single function call for convenience,
         handling both RAG and direct generation modes.
-
+        
         Args:
-            inputs (Union[str, List[str]]): 
+            inputs (`Union[str, List[str]]`):
                 A single input string or a list of input strings representing questions or prompts.
-            do_retrieval (bool, optional): 
-                If True, performs retrieval-augmented generation (RAG). If False, only the generator is used. Defaults to False.
-            num_docs (int, optional): 
-                Number of documents to retrieve per query if `do_retrieval=True`. Defaults to 5.
-            skip_special_tokens (bool, optional): 
-                Whether to skip special tokens in the generated output. Defaults to True.
-            instruction (Optional[str], optional): 
+            do_retrieval (`bool`, *optional*, defaults to False):
+                If True, performs retrieval-augmented generation (RAG). If False, only the generator is used.
+            num_docs (`int`, *optional*, defaults to 5):
+                Number of documents to retrieve per query if `do_retrieval=True`.
+            skip_special_tokens (`bool`, *optional*, defaults to True):
+                Whether to skip special tokens in the generated output.
+            instruction (`str`, *optional*):
                 Optional instruction string for guiding generation, included in the prompt if provided.
-            system_prompt (Optional[str], optional): 
-                Optional system message used in chat-style prompts. Defaults to None.
-            generator_max_length (int, optional): 
-                Maximum length (in tokens) of the input passed to the generator. Defaults to 128.
-            **kwargs: 
+            system_prompt (`str`, *optional*):
+                Optional system message used in chat-style prompts.
+            generator_max_length (`int`, *optional*, defaults to 128):
+                Maximum length (in tokens) of the input passed to the generator.
+            **kwargs:
                 Additional keyword arguments passed to `generate()`.
-
+                
         Returns:
-            List[Dict[str, str]]: 
-                A list of dictionaries, each containing:
-                    - 'generated_text': the generated response string
-                    - 'retrieved_context' (optional): retrieved context if `do_retrieval=True`
+            `List[Dict[str, str]]`: A list of dictionaries, each containing:
+                - `generated_text`: the generated response string
+                - `retrieved_context` (optional): retrieved context if `do_retrieval=True`
         """
-
         
         if isinstance(inputs, str):
             inputs = [inputs]
@@ -134,7 +137,6 @@ class RAGSequence(nn.Module):
         
         return self.generate(**encoded_inputs, do_retrieval=do_retrieval, **kwargs)
     
-    
     def generate(
         self, 
         input_ids: torch.Tensor,
@@ -152,54 +154,52 @@ class RAGSequence(nn.Module):
         top_p: float = 1.0,
         top_k: int = 50,
         **kwargs
-    ) -> List[Dict[str, str]]:
+    ) -> List[Dict[str, str]]:   
+        """
+        Perform batched text generation with optional document retrieval.
         
-        """
-        Perform batched text generation using a decoder-only language model with optional document retrieval (RAG setup).
-
-        This function supports both standard generation and Retrieval-Augmented Generation (RAG) depending on 
-        the `do_retrieval` flag. It is designed for inference and supports a range of decoding parameters.
-
+        This function supports both standard generation and Retrieval-Augmented Generation (RAG)
+        depending on the `do_retrieval` flag. It is designed for inference and supports a range
+        of decoding parameters.
+        
         Args:
-            input_ids (torch.Tensor): 
-                Tokenized input IDs of shape [batch_size, max_seq_len].
-            attention_mask (torch.Tensor): 
-                Attention mask of shape [batch_size, max_seq_len].
-            do_retrieval (bool): 
-                If True, performs document retrieval and prompt augmentation (RAG mode). 
+            input_ids (`torch.Tensor`):
+                Tokenized input IDs of shape `(batch_size, self.question_max_seq_len_inference)`.
+            attention_mask (`torch.Tensor`):
+                Attention mask of shape `(batch_size, self.question_max_seq_len_inference)`.
+            do_retrieval (`bool`):
+                If True, performs document retrieval and prompt augmentation (RAG mode).
                 If False, uses only the generator for generation.
-            num_docs (int, optional): 
-                Number of documents to retrieve per query. Defaults to 5.
-            skip_special_tokens (bool, optional): 
-                Whether to skip special tokens in the final generated output. Defaults to True.
-            instruction (Optional[str], optional): 
+            num_docs (`int`, *optional*, defaults to 5):
+                Number of documents to retrieve per query.
+            skip_special_tokens (`bool`, *optional*, defaults to True):
+                Whether to skip special tokens in the final generated output.
+            instruction (`str`, *optional*):
                 Optional instruction string to include in the prompt.
-            system_prompt (Optional[str], optional): 
+            system_prompt (`str`, *optional*):
                 Optional system prompt string for the chat format.
-            num_return_sequences (int, optional): 
-                Number of sequences to generate per input. Defaults to 1.
-            max_new_tokens (int, optional): 
-                Maximum number of tokens to generate per output. Defaults to 128.
-            no_repeat_ngram_size (int, optional): 
-                Size of n-grams that should not be repeated. Defaults to 3.
-            do_sample (bool, optional): 
-                Whether to sample from the logits distribution (vs. greedy decoding). Defaults to False.
-            temperature (float, optional): 
-                Sampling temperature for softmax distribution. Defaults to 1.0.
-            top_p (float, optional): 
-                Nucleus sampling: cumulative probability cutoff. Defaults to 1.0.
-            top_k (int, optional): 
-                Top-k sampling: limits sampling to top-k logits. Defaults to 50.
-            **kwargs: 
+            num_return_sequences (`int`, *optional*, defaults to 1):
+                Number of sequences to generate per input.
+            max_new_tokens (`int`, *optional*, defaults to 128):
+                Maximum number of tokens to generate per output.
+            no_repeat_ngram_size (`int`, *optional*, defaults to 3):
+                Size of n-grams that should not be repeated.
+            do_sample (`bool`, *optional*, defaults to False):
+                Whether to sample from the logits distribution (vs. greedy decoding).
+            temperature (`float`, *optional*, defaults to 1.0):
+                Sampling temperature for softmax distribution.
+            top_p (`float`, *optional*, defaults to 1.0):
+                Nucleus sampling: cumulative probability cutoff.
+            top_k (`int`, *optional*, defaults to 50):
+                Top-k sampling: limits sampling to top-k logits.
+            **kwargs:
                 Additional keyword arguments for `generate()` from `AutoModelForCausalLM`.
-
+                
         Returns:
-            List[Dict[str, str]]: 
-                A list of dictionaries, each containing:
-                    - 'generated_text': the full generated output (str)
-                    - 'retrieved_context' (optional): the context used for RAG if `do_retrieval=True`
+            `List[Dict[str, str]]`: A list of dictionaries, each containing:
+                - `generated_text`: the full generated output
+                - `retrieved_context` (optional): the context used for RAG if `do_retrieval=True`
         """
-
         
         if do_retrieval:
             # Returns top num_docs documents
@@ -317,11 +317,11 @@ class RAGSequence(nn.Module):
         return batch_outputs
         
     def prepare_for_sft(self) -> None:
-           
         """
-        Prepare the model for supervised finetuning (SFT) by setting up the chat format,
-        and ensuring custom padding token is added to the generator tokenizer. Model embedding
-        matrix's vocab_size is resized accordingly.
+        Prepare the model for supervised finetuning (SFT).
+        
+        This method sets up the chat format and ensures a custom padding token is added to the 
+        generator tokenizer. The model's embedding matrix vocabulary size is resized accordingly.
         """
         
         if self.generator_tokenizer.chat_template:
@@ -340,11 +340,17 @@ class RAGSequence(nn.Module):
         embedding_dim_after = self.generator.get_input_embeddings().weight.shape
         logger.info(f"Embedding matrix before: {embedding_dim_before}, after setup_chat_format(): {embedding_dim_after}")
         
-        # SEE Llama tokenizers and their training strategy
-        # self.generator_tokenizer.padding_side = "right"
+        # SEE Llama tokenizers and their training strategy (right padding for training, left for inference)
         
     def add_pad_token(self, pad_token: str) -> None:
-        """Add custom pad token to the generator tokenizer and resize the model's embedding matrix."""
+        """
+        Add a custom pad token to the generator tokenizer.
+        
+        Args:
+            pad_token (`str`):
+                Token to use as padding token.
+        """
+
         vocab_size = self.generator.config.vocab_size
         
         self.generator_tokenizer.add_tokens([pad_token])
@@ -361,24 +367,25 @@ class RAGSequence(nn.Module):
         answer_texts: List[str], 
         debug_print: bool = False
     ) -> Optional[torch.Tensor]:
-        
         """
-        Forward pass through RAGSequence model. Retrieves documents, generates sequences and computes loss.
+        Forward pass through RAGSequence model.
+        
+        Retrieves documents, generates sequences and computes loss.
         
         Args:
-            input_ids (torch.Tensor): 
-                [batch_size, max_seq_len] tokenized input ids using DRPQuestionEncoderTokenizer
-                where max_seq_len is the max sequence length for DPRQuestionEncoder (see SFTDataset in dataloader.py)
-            attention_mask (torch.Tensor): 
-                [batch_size, max_seq_len] for question encoder
-            answer_texts (List[str]): 
-                List of answer strings of length [batch_size]
-            debug_print (bool): 
-                To print debug information
-            
+            input_ids (`torch.Tensor`):
+                Tensor of shape `(batch_size, max_seq_len)` containing tokenized input IDs using 
+                DPRQuestionEncoderTokenizer where max_seq_len is the maximum sequence length for 
+                DPRQuestionEncoder during training.
+            attention_mask (`torch.Tensor`):
+                Tensor of shape `(batch_size, max_seq_len)` for question encoder.
+            answer_texts (`List[str]`):
+                List of answer strings of length `batch_size`.
+            debug_print (`bool`, *optional*, defaults to False):
+                Whether to print debug information.
+                
         Returns:
-            loss (torch.Tensor):
-                Loss tensor if labels are provided, else None  
+            `torch.Tensor`, *optional*: Loss tensor if labels are provided, else None.
         """
         
         # Retrieve documents
@@ -400,21 +407,24 @@ class RAGSequence(nn.Module):
         input_ids: torch.Tensor, 
         attention_mask: torch.Tensor, 
         num_docs: int = 5
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
+    ) -> Tuple[torch.Tensor, torch.Tensor]:  
         """
-        Retrieves top num_docs documents using Dense Passage Retrieval (DPR) by computing retriever scores.
+        Retrieve top documents using Dense Passage Retrieval (DPR).
+        
         Args:
-            input_ids (torch.Tensor):
-                [batch_size, max_seq_len] tokenized input ids using DRPQuestionEncoderTokenizer
-            attention_mask (torch.Tensor):
-                [batch_size, max_seq_len] for question encoder
-            num_docs (int):
-                Number of documents to retrieve
+            input_ids (`torch.Tensor`):
+                Tensor of shape `(batch_size, max_seq_len)` containing tokenized input IDs using 
+                DPRQuestionEncoderTokenizer where max_seq_len is the maximum sequence length for 
+                DPRQuestionEncoder during training.
+            attention_mask (`torch.Tensor`):
+                Tensor of shape `(batch_size, max_seq_len)` for question encoder.
+            num_docs (`int`, *optional*, defaults to 5):
+                Number of documents to retrieve.
+                
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - retrieved_doc_ids: [batch_size, num_docs] containing retrieved document indices
-                - retriever_scores: [batch_size, num_docs] containing retriever scores
+            `Tuple[torch.Tensor, torch.Tensor]`:
+                - retrieved_doc_ids: Tensor of shape `(batch_size, num_docs)` containing retrieved document indices.
+                - retriever_scores: Tensor of shape `(batch_size, num_docs)` containing retriever scores.
         """
         
         question_hidden_states = self.question_encoder(input_ids=input_ids, attention_mask=attention_mask)[0]
@@ -441,28 +451,30 @@ class RAGSequence(nn.Module):
         answer_texts: List[str],
         debug_print: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        
         """
-        Construct proper input (prompts) and target (labels) tensors for the generator. NOTE: Not to confuse 
-        max_seq_len (of DPRQuestionEncoderTokenizer) with self.max_seq_len, which is for self.generator_tokenizer
+        Construct input prompts and target labels for the generator.
         
         Args:
-            input_ids (torch.Tensor): 
-                Tokenized input IDs of shape [batch_size, max_seq_len (DPR tokenizer)].
-            retrieved_doc_ids (torch.Tensor): 
-                Tensor of shape [batch_size, num_docs] containing retrieved document indices.
-            answer_texts (List[str]): 
-                List of answer strings of length [batch_size].
-            
+            input_ids (`torch.Tensor`):
+                Tensor of shape `(batch_size, max_seq_len)` containing tokenized input IDs using
+                DPRQuestionEncoderTokenizer where max_seq_len is the maximum sequence length for 
+                DPRQuestionEncoder during training.
+            retrieved_doc_ids (`torch.Tensor`):
+                Tensor of shape `(batch_size, num_docs)` containing retrieved document indices.
+            answer_texts (`List[str]`):
+                List of answer strings of length `batch_size`.
+            debug_print (`bool`, *optional*, defaults to False):
+                Whether to print debug information.
+                
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - outputs.logits: [batch_size * num_docs, max_seq_len, vocab_size] for generator
-                - labels: [batch_size * num_docs, self.max_seq_len] for generator
+            `Tuple[torch.Tensor, torch.Tensor]`:
+                - logits: Tensor of shape `(batch_size * num_docs, self.generator_max_seq_len_train, vocab_size)` for generator.
+                - labels: Tensor of shape `(batch_size * num_docs, self.generator_max_seq_len_train)` for generator.
         """
     
         batch_size, num_docs = retrieved_doc_ids.shape
         total_samples = batch_size * num_docs
-        generator_input_ids = torch.zeros((total_samples, self.max_seq_len), dtype=torch.long).to(self.device)
+        generator_input_ids = torch.zeros((total_samples, self.generator_max_seq_len_train), dtype=torch.long).to(self.device)
 
         for i in range(batch_size):
             question = self.retriever.question_encoder_tokenizer.decode(input_ids[i], skip_special_tokens=True)
@@ -492,7 +504,7 @@ class RAGSequence(nn.Module):
                     return_tensors="pt",
                     truncation=True,
                     padding="max_length",
-                    max_length=self.max_seq_len_train
+                    max_length=self.generator_max_seq_len_train
                 )
 
         generator_attention_mask = (generator_input_ids != self.generator_tokenizer.pad_token_id).long()
@@ -551,31 +563,28 @@ class RAGSequence(nn.Module):
         labels: torch.Tensor,
         debug_print: bool = False
     ) -> torch.Tensor:
-        
         """
-        Computes loss for join-optimization of retriever and generator (decoder-only LLM) components.
-
+        Compute loss for joint optimization of retriever and generator components.
+        
         The generator loss is calculated using cross-entropy over token logits, while the 
         retriever loss is implicitly computed through marginalization over retrieved contexts.
-
+        
         Args:
-            retriever_scores (torch.Tensor): 
-                Tensor of shape [batch_size, num_docs] representing the relevance scores 
+            retriever_scores (`torch.Tensor`):
+                Tensor of shape `(batch_size, num_docs)` representing the relevance scores 
                 assigned by the retriever to each document per query.
-            logits (torch.Tensor): 
-                Tensor of shape [batch_size * num_docs, max_seq_len, vocab_size] representing 
+            logits (`torch.Tensor`):
+                Tensor of shape `(batch_size * num_docs, self.generator_max_seq_len_train, vocab_size)` representing 
                 the generator's predicted token distributions.
-            labels (torch.Tensor): 
-                Tensor of shape [batch_size * num_docs, max_seq_len] containing the token-level 
+            labels (`torch.Tensor`):
+                Tensor of shape `(batch_size * num_docs, self.generator_max_seq_len_train)` containing the token-level 
                 ground truth, where ignored positions are typically marked with -100.
-            debug_print (bool, optional): 
-                If True, prints internal stats for debugging. Defaults to False.
-
+            debug_print (`bool`, *optional*, defaults to False):
+                Whether to print internal stats for debugging.
+                
         Returns:
-            torch.Tensor: 
-                A scalar tensor representing the combined loss value.
+            `torch.Tensor`: A scalar tensor representing the combined loss value.
         """
-
         
         vocab_size = logits.shape[-1]
         batch_size, num_docs = retriever_scores.shape
@@ -610,7 +619,7 @@ class RAGSequence(nn.Module):
             logger.info(f"seq_log_probs:\n{seq_log_probs}")
 
         # Compute generator loss, see notes and torch.CrossEntropy() docs
-        # N spans batch_size, num_docs and max_seq_len,
+        # N spans batch_size, num_docs and self.generator_max_seq_len_train,
         # so avg not by N but by N - |labels == -100| = mask.sum()
         gen_loss = -masked_log_probs.sum()/mask.sum()
         if debug_print:
@@ -635,7 +644,12 @@ class RAGSequence(nn.Module):
     # Other cleanup options like accelerate.clear(), gc.collect(), torch.cuda.ipc_collect()
     # empty CUDA cache, del model don't seem to work, see 03/15 TODO point 3.
     def to_cpu(self) -> None:
-        """Post-training cleanup by moving all components to CPU."""
+        """
+        Move all model components to CPU.
+        
+        This is useful for post-training cleanup and memory management.
+        """
+
         self.question_encoder.to('cpu')
         self.generator.to('cpu')
         if hasattr(self, 'retriever') and hasattr(self.retriever, 'to'):
