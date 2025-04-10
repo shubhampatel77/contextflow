@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import (
     AutoTokenizer, DPRQuestionEncoder, DPRQuestionEncoderTokenizer,
-    RagRetriever, get_linear_schedule_with_warmup
+    RagRetriever, AutoModelForCausalLM, get_linear_schedule_with_warmup
 )
 from torch.utils.data import DataLoader, Dataset
 import bitsandbytes as bnb
